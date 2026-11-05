@@ -207,6 +207,12 @@ Adjust scroll speed with:
 | Copy   | `Cmd+C` | `Ctrl+Shift+C` |
 | Paste  | `Cmd+V` | `Ctrl+Shift+V` |
 
+### Pasting Images and Files
+
+When the clipboard holds an image, pasting sends `Ctrl+V` to the terminal, so that programs such as Claude Code or Codex can read the image from the system clipboard. When it holds files copied from your file manager, their paths are pasted.
+
+In a terminal running on a [remote host](./remote-development.md), programs can't read your local clipboard or files. Instead, Zed uploads the image or files to the remote host's temporary directory and pastes their remote paths. Folders can't be pasted this way.
+
 ### Copy on Select
 
 Automatically copy selected text to the clipboard:

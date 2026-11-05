@@ -323,6 +323,7 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_open_server_settings);
         session.add_entity_request_handler(Self::handle_get_directory_environment);
         session.add_entity_request_handler(Self::handle_get_terminal_shell);
+        session.add_entity_request_handler(Self::handle_upload_temp_files);
         session.add_entity_message_handler(Self::handle_toggle_lsp_logs);
         session.add_entity_request_handler(Self::handle_open_image_by_path);
         session.add_entity_request_handler(Self::handle_trust_worktrees);
@@ -1497,6 +1498,31 @@ impl HeadlessProject {
         Ok(proto::GetTerminalShellResponse {
             shell: Some(task::shell_to_proto(shell)),
         })
+    }
+
+    async fn handle_upload_temp_files(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::UploadTempFiles>,
+        cx: AsyncApp,
+    ) -> Result<proto::UploadTempFilesResponse> {
+        let fs = this.read_with(&cx, |this, _| this.fs.clone());
+        let temp_dir = std::env::temp_dir();
+        let mut paths = Vec::with_capacity(envelope.payload.files.len());
+        for file in envelope.payload.files {
+            let file_name = Path::new(&file.name);
+            anyhow::ensure!(
+                file_name.file_name() == Some(file_name.as_os_str()),
+                "invalid file name {:?}",
+                file.name
+            );
+            // A directory per file keeps files that share a name from overwriting each other.
+            let directory = temp_dir.join(format!("zed-paste-{}", uuid::Uuid::new_v4().simple()));
+            let path = directory.join(file_name);
+            fs.create_dir(&directory).await?;
+            fs.write(&path, &file.content).await?;
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        Ok(proto::UploadTempFilesResponse { paths })
     }
 }
 

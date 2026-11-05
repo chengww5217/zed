@@ -67,3 +67,21 @@ message GetTerminalShell {
 message GetTerminalShellResponse {
   Shell shell = 1;
 }
+
+// Writes files into new temporary directories on the remote host, so that
+// images and files pasted into a remote terminal can be referred to there.
+message UploadTempFiles {
+  uint64 project_id = 1;
+  repeated TempFile files = 2;
+}
+
+message TempFile {
+  // A file name without any directory components.
+  string name = 1;
+  bytes content = 2;
+}
+
+message UploadTempFilesResponse {
+  // Absolute paths on the remote host, in the same order as the request's files.
+  repeated string paths = 1;
+}

@@ -2964,6 +2964,16 @@ impl Terminal {
         })
     }
 
+    /// Whether the terminal's shell runs on a remote host rather than on this machine.
+    pub fn is_remote_terminal(&self) -> bool {
+        self.is_remote_terminal
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_remote_terminal_for_test(&mut self, is_remote_terminal: bool) {
+        self.is_remote_terminal = is_remote_terminal;
+    }
+
     pub fn working_directory(&self) -> Option<PathBuf> {
         if self.is_remote_terminal {
             // We can't yet reliably detect the working directory of a shell on the

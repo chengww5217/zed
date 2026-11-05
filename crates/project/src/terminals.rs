@@ -307,6 +307,35 @@ impl Project {
         self.create_terminal_shell_internal(working_directory, true, cx)
     }
 
+    /// Writes the given `(file_name, content)` pairs into temporary directories on the
+    /// remote host, so that a remote terminal can refer to them. Returns the paths the
+    /// files were written to on the remote host, in the same order.
+    pub fn upload_temp_files(
+        &self,
+        files: Vec<(String, Vec<u8>)>,
+        cx: &App,
+    ) -> Task<Result<Vec<String>>> {
+        let Some(remote_client) = self.remote_client.as_ref() else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "uploading files requires a remote project"
+            )));
+        };
+        let request = remote_client
+            .read(cx)
+            .proto_client()
+            .request(proto::UploadTempFiles {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                files: files
+                    .into_iter()
+                    .map(|(name, content)| proto::TempFile { name, content })
+                    .collect(),
+            });
+        cx.background_spawn(async move {
+            let response = request.await.context("failed to upload files")?;
+            Ok(response.paths)
+        })
+    }
+
     /// Internal method for creating terminal shells.
     /// If force_local is true, creates a local terminal even if the project has a remote client.
     /// This allows "breaking out" to a local shell in remote projects.

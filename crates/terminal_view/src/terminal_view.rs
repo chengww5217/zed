@@ -4,6 +4,7 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use anyhow::Context as _;
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
@@ -16,7 +17,7 @@ use gpui::{
 };
 use menu;
 use persistence::TerminalDb;
-use project::{Project, ProjectEntryId, search::SearchQuery};
+use project::{Fs, Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
@@ -55,6 +56,7 @@ use workspace::{
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
+    notifications::NotifyTaskExt as _,
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -77,6 +79,40 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Files pasted into a remote terminal are read into memory and sent to the remote
+/// host in a single message, so their combined size is capped.
+const MAX_REMOTE_PASTE_BYTES: u64 = 100 * 1024 * 1024;
+
+async fn read_files_for_upload(
+    fs: &dyn Fs,
+    paths: &[PathBuf],
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut total_len = 0;
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = fs
+            .metadata(path)
+            .await?
+            .with_context(|| format!("{} does not exist", path.display()))?;
+        anyhow::ensure!(
+            !metadata.is_dir,
+            "Pasting folders into a remote terminal is not supported"
+        );
+        total_len += metadata.len;
+        anyhow::ensure!(
+            total_len <= MAX_REMOTE_PASTE_BYTES,
+            "Can't paste more than {} MB of files into a remote terminal",
+            MAX_REMOTE_PASTE_BYTES / 1024 / 1024
+        );
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("invalid file name: {}", path.display()))?;
+        files.push((name.to_string(), fs.load_bytes(path).await?));
+    }
+    Ok(files)
+}
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -1001,13 +1037,34 @@ impl TerminalView {
         let Some(clipboard) = cx.read_from_clipboard() else {
             return;
         };
+        let is_remote_terminal = self.terminal.read(cx).is_remote_terminal();
 
         match clipboard.entries().first() {
             Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
-                self.forward_ctrl_v(cx);
+                if is_remote_terminal {
+                    let file = (
+                        format!("image.{}", image.format.extension()),
+                        image.bytes.clone(),
+                    );
+                    self.upload_and_paste_paths(Task::ready(Ok(vec![file])), window, cx);
+                } else {
+                    self.forward_ctrl_v(cx);
+                }
             }
             Some(ClipboardEntry::ExternalPaths(paths)) => {
-                self.add_paths_to_terminal(paths.paths(), window, cx);
+                if is_remote_terminal {
+                    let Some(project) = self.project.upgrade() else {
+                        return;
+                    };
+                    let fs = project.read(cx).fs().clone();
+                    let paths = paths.paths().to_vec();
+                    let files = cx.background_spawn(async move {
+                        read_files_for_upload(fs.as_ref(), &paths).await
+                    });
+                    self.upload_and_paste_paths(files, window, cx);
+                } else {
+                    self.add_paths_to_terminal(paths.paths(), window, cx);
+                }
             }
             _ => {
                 if let Some(text) = clipboard.text() {
@@ -1057,15 +1114,46 @@ impl TerminalView {
         if self.read_only {
             return;
         }
+        window.focus(&self.focus_handle(cx), cx);
+        self.paste_paths(paths.iter().filter_map(|path| path.to_str()), cx);
+    }
+
+    fn paste_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>, cx: &mut App) {
+        if self.read_only {
+            return;
+        }
         let mut text = paths
-            .iter()
-            .filter_map(|path| Some(format!(" {}", shlex::try_quote(path.to_str()?).ok()?)))
+            .into_iter()
+            .filter_map(|path| Some(format!(" {}", shlex::try_quote(path).ok()?)))
             .collect::<String>();
         text.push(' ');
-        window.focus(&self.focus_handle(cx), cx);
         self.terminal.update(cx, |terminal, _| {
             terminal.paste(&text);
         });
+    }
+
+    /// Uploads files to the remote host and pastes their remote paths, since a shell
+    /// on the remote host can't read this machine's clipboard or files.
+    fn upload_and_paste_paths(
+        &self,
+        files: Task<anyhow::Result<Vec<(String, Vec<u8>)>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.project.clone();
+        cx.spawn(async move |this, cx| {
+            let files = files.await?;
+            let remote_paths = project
+                .update(cx, |project, cx| project.upload_temp_files(files, cx))?
+                .await?;
+            // The terminal may have been closed while the files were uploading.
+            this.update(cx, |this, cx| {
+                this.paste_paths(remote_paths.iter().map(String::as_str), cx);
+            })
+            .ok();
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
     }
 
     fn send_text(&mut self, text: &SendText, _: &mut Window, cx: &mut Context<Self>) {
@@ -2324,6 +2412,8 @@ mod tests {
     use gpui::{ScrollDelta, TestAppContext, UpdateGlobal, VisualTestContext};
     use project::{Entry, Project, ProjectPath, Worktree};
     use remote::RemoteClient;
+    use rpc::{AnyProtoClient, proto};
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     use util::paths::PathStyle;
     use util::rel_path::RelPath;
@@ -2876,7 +2966,8 @@ mod tests {
         cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) {
-        let (_project, workspace) = init_remote_test(cx, server_cx).await;
+        let (_project, workspace, _window_handle, _server_session) =
+            init_remote_test(cx, server_cx).await;
 
         cx.read(|cx| {
             let workspace = workspace.read(cx);
@@ -2885,6 +2976,124 @@ mod tests {
             assert!(workspace.worktrees(cx).next().is_none());
             assert_eq!(default_working_directory(workspace, cx), None);
         });
+    }
+
+    #[gpui::test]
+    async fn remote_terminal_paste_uploads_images_and_files(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (project, workspace, window_handle, server_session) =
+            init_remote_test(cx, server_cx).await;
+        let uploads = server_cx.new(|_| Vec::<Vec<(String, Vec<u8>)>>::new());
+        server_session.add_request_handler::<proto::UploadTempFiles, _, _, _>(
+            uploads.downgrade(),
+            |uploads, envelope, mut cx| async move {
+                let files = envelope
+                    .payload
+                    .files
+                    .into_iter()
+                    .map(|file| (file.name, file.content))
+                    .collect::<Vec<_>>();
+                let paths = files
+                    .iter()
+                    .map(|(name, _)| format!("/tmp/zed-paste/{name}"))
+                    .collect();
+                uploads.update(&mut cx, |uploads, _| uploads.push(files));
+                Ok(proto::UploadTempFilesResponse { paths })
+            },
+        );
+
+        let fs = project.read_with(cx, |project, _| project.fs().as_fake());
+        fs.insert_tree(
+            util::path!("/local"),
+            json!({
+                "notes.txt": "notes",
+                "two words.txt": "two words",
+                "folder": {},
+            }),
+        )
+        .await;
+
+        let (_pane, terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, false, cx);
+        let (_pane, local_terminal, local_terminal_view) =
+            add_display_only_terminal(&project, window_handle, false, false, cx);
+        terminal.update(cx, |terminal, _| {
+            terminal.set_remote_terminal_for_test(true)
+        });
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+
+        let mut paste = |clipboard: gpui::ClipboardItem,
+                         terminal: &Entity<Terminal>,
+                         terminal_view: &Entity<TerminalView>| {
+            cx.update(|window, cx| {
+                cx.write_to_clipboard(clipboard);
+                terminal_view.update(cx, |view, cx| view.paste(&Paste, window, cx));
+            });
+            cx.run_until_parked();
+            terminal.update(&mut cx, |terminal, _| terminal.take_input_log())
+        };
+
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, b"png".to_vec());
+        assert_eq!(
+            paste(
+                gpui::ClipboardItem::new_image(&image),
+                &terminal,
+                &terminal_view
+            ),
+            vec![b" /tmp/zed-paste/image.png ".to_vec()],
+        );
+
+        let files = ExternalPaths(
+            vec![
+                PathBuf::from(util::path!("/local/notes.txt")),
+                PathBuf::from(util::path!("/local/two words.txt")),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            paste(
+                ClipboardEntry::ExternalPaths(files).into(),
+                &terminal,
+                &terminal_view
+            ),
+            vec![b" /tmp/zed-paste/notes.txt '/tmp/zed-paste/two words.txt' ".to_vec()],
+        );
+
+        // Terminals running locally keep forwarding Ctrl+V, even in a remote project.
+        assert_eq!(
+            paste(
+                gpui::ClipboardItem::new_image(&image),
+                &local_terminal,
+                &local_terminal_view
+            ),
+            vec![vec![0x16]],
+        );
+
+        let folder = ExternalPaths(vec![PathBuf::from(util::path!("/local/folder"))].into());
+        assert!(
+            paste(
+                ClipboardEntry::ExternalPaths(folder).into(),
+                &terminal,
+                &terminal_view
+            )
+            .is_empty()
+        );
+        workspace.read_with(&cx, |workspace, _| {
+            assert_eq!(workspace.notification_ids().len(), 1);
+        });
+
+        assert_eq!(
+            uploads.read_with(server_cx, |uploads, _| uploads.clone()),
+            vec![
+                vec![("image.png".to_string(), b"png".to_vec())],
+                vec![
+                    ("notes.txt".to_string(), b"notes".to_vec()),
+                    ("two words.txt".to_string(), b"two words".to_vec()),
+                ],
+            ],
+        );
     }
 
     // No active entry, but a worktree, worktree is a file -> parent directory
@@ -3115,7 +3324,12 @@ mod tests {
     async fn init_remote_test(
         cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
-    ) -> (Entity<Project>, Entity<Workspace>) {
+    ) -> (
+        Entity<Project>,
+        Entity<Workspace>,
+        gpui::WindowHandle<MultiWorkspace>,
+        AnyProtoClient,
+    ) {
         cx.update(|cx| {
             release_channel::init(semver::Version::new(0, 0, 0), cx);
         });
@@ -3167,7 +3381,7 @@ mod tests {
             .read_with(cx, |mw, _| mw.workspace().clone())
             .unwrap();
 
-        (project, workspace)
+        (project, workspace, window_handle, server_session)
     }
 
     /// Creates a file in the given worktree and returns its entry.

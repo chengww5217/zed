@@ -3357,6 +3357,55 @@ async fn test_remote_resolve_abs_path(cx: &mut TestAppContext, server_cx: &mut T
 }
 
 #[gpui::test]
+async fn test_remote_upload_temp_files(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+
+    let files = [
+        ("image.png", "png"),
+        ("notes.txt", "first"),
+        ("notes.txt", "second"),
+    ];
+    let paths = project
+        .update(cx, |project, cx| {
+            project.upload_temp_files(
+                files
+                    .iter()
+                    .map(|(name, content)| (name.to_string(), content.as_bytes().to_vec()))
+                    .collect(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(paths.len(), files.len());
+    for (path, (name, content)) in paths.iter().zip(files) {
+        let path = Path::new(path);
+        assert_eq!(path.file_name().unwrap(), name);
+        assert_eq!(
+            path.parent().and_then(Path::parent),
+            Some(std::env::temp_dir().as_path())
+        );
+        assert_eq!(fs.load(path).await.unwrap(), content);
+    }
+    assert_ne!(
+        Path::new(&paths[1]).parent(),
+        Path::new(&paths[2]).parent(),
+        "files with the same name should not overwrite each other"
+    );
+
+    for name in ["", "..", "../escape.txt", "nested/file.txt"] {
+        let result = project
+            .update(cx, |project, cx| {
+                project.upload_temp_files(vec![(name.to_string(), b"content".to_vec())], cx)
+            })
+            .await;
+        assert!(result.is_err(), "{name:?} should be rejected");
+    }
+}
+
+#[gpui::test]
 async fn test_resolve_abs_file_path_canonical(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,
